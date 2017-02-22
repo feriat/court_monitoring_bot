@@ -285,6 +285,12 @@ def test(bot, update, user_data):
     print update
 
 
+def status(bot, update):
+    print update
+    bot.sendMessage(update.message.chat_id,
+                    text='{0}'.format(update.message.chat_id))
+
+
 def error(bot, update, error):
     logger.error('Update "%s" caused error "%s"' % (update, error))
     # bot.sendMessage(ADMIN_CHAT_ID, text='Update "%s" caused error "%s"' % (update, error))
@@ -305,7 +311,13 @@ def main():
         entry_points=[CommandHandler('start', start, pass_user_data=True),
                       RegexHandler(u'^Обновить данные$',
                                    update,
-                                   pass_user_data=True)
+                                   pass_user_data=True),
+                      RegexHandler(u'^Фамилия$',
+                                    await_last_name,
+                                    pass_user_data=True),
+                      RegexHandler(u'^Номер мирового суда$',
+                                    await_court_num,
+                                    pass_user_data=True),
                       ],
 
         states={
@@ -331,6 +343,7 @@ def main():
     dp.add_handler(RegexHandler(
         u'^Проверить статус судов$', court_status_check))
     dp.add_handler(RegexHandler(u'^Отменить подписку$', unsubscribe))
+    dp.add_handler(CommandHandler('status', status))
 
     # log all errors
     dp.add_error_handler(error)

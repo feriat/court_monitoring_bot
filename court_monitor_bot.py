@@ -5,7 +5,8 @@ import telegram
 from telegram import Bot, ReplyKeyboardMarkup, ChatAction
 from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
-    CallbackQueryHandler, RegexHandler, ConversationHandler
+    CallbackQueryHandler, RegexHandler, ConversationHandler,
+    Job
 )
 
 import botan
@@ -13,7 +14,8 @@ import botan
 import datetime
 
 from peewee import SqliteDatabase, Model, CharField, DateTimeField, \
-    IntegerField, BooleanField, BigIntegerField, TextField
+    IntegerField, BooleanField, BigIntegerField, TextField, \
+    IntegrityError
 
 import logging
 
@@ -25,6 +27,7 @@ urllib3.disable_warnings()
 import time
 
 from court import get_magistrate_court, make_url
+from fake_update import FakeUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +63,8 @@ AWAITING_DATA_MARKUP = ReplyKeyboardMarkup(AWAITING_DATA,
 FILLED_MARKUP = ReplyKeyboardMarkup(FILLED, one_time_keyboard=False)
 
 CHOOSING, TYPING_REPLY = range(2)
-TEST = 111
 
+DAILY = 60.0 * 60 * 24
 
 def _now():
     return datetime.datetime.now()
@@ -80,7 +83,6 @@ class Subscriber(Model):
     court_info = CharField(default="{}")
     court_last_name = TextField(default="")
     email = TextField(default="")
-
     class Meta:
         database = SqliteDatabase('database/DB.db')
 
@@ -135,12 +137,19 @@ def check_data_completeness(bot, update, *args):
 @botan_track('start')
 def start(bot, update, user_data):
     try:
-        subscriber = Subscriber.create_or_get(
+        subscriber = Subscriber.create(
+            chat_id=update.message.chat_id,
+            first_name=update.message.from_user.first_name,
+            username=update.message.from_user.username,
+        )
+    except IntegrityError:
+        subscriber = Subscriber.update(
             chat_id=update.message.chat_id,
             first_name=update.message.from_user.first_name,
             username=update.message.from_user.username,
             deleted=False,
         )
+        subscriber.execute()
     except Exception, e:
         logger.error(e)
     bot.sendMessage(chat_id=update.message.chat_id, text=u'''Добрый день!\n\n''' + HELP_MESSAGE,
@@ -218,7 +227,7 @@ def received_information(bot, update, user_data):
 
 
 @botan_track('court_status_check')
-def court_status_check(bot, update):
+def court_status_check(bot, update, silent_if_fine=False):
     plaintiff = u'жилсервис'
     for subscriber in Subscriber.select().where(
         Subscriber.chat_id == update.message.chat_id
@@ -227,19 +236,23 @@ def court_status_check(bot, update):
         court_info = json.loads(court_info or "{}")
         court_number = court_info.get('magistrate_court_num', None)
         if not court_last_name or not court_number:
-            update.message.reply_text("Не все поля заполнены: мне необходимо знать "
-                                      "как минимум номер суда и вашу фамилию.")
+            if not silent_if_fine:
+                update.message.reply_text("Не все поля заполнены: мне необходимо знать "
+                                          "как минимум номер суда и вашу фамилию.")
             return
 
-        update.message.reply_text(u"Проверяю мировой суд номер {}, ответчик `{}`, "
-                                  u"истец {}".format(
-                                      court_number, court_last_name, plaintiff),
-                                  reply_markup=FILLED_MARKUP)
+        if not silent_if_fine:
+            update.message.reply_text(u"Проверяю мировой суд номер {}, ответчик `{}`, "
+                                      u"истец {}".format(
+                                          court_number, court_last_name, plaintiff),
+                                      reply_markup=FILLED_MARKUP)
         try:
             df = get_magistrate_court(
                 court='mos-sud', court_num=court_number, defendant=court_last_name, plaintiff=plaintiff
             )
             if df is not None and len(df) > 0:
+                print make_url(court='mos-sud', court_num=court_number,
+                               defendant=court_last_name, plaintiff=plaintiff)
                 update.message.reply_text(
                     u"ВНИМАНИЕ! \n"
                     u"Найден иск против вас! \n"
@@ -248,7 +261,7 @@ def court_status_check(bot, update):
                                  defendant=court_last_name, plaintiff=plaintiff)
                     ),
                     reply_markup=FILLED_MARKUP)
-            else:
+            elif not silent_if_fine:
                 update.message.reply_text(
                     u"Исков не найдено, отлично! \n"
                     u"Убедиться в этом можно по ссылке: {}".format(
@@ -259,15 +272,28 @@ def court_status_check(bot, update):
         except ValueError, e:
             print e
             raise
-            update.message.reply_text(
-                u"Указанная фамилия `{}` или номер суда `{}` не подходят к формату сайта суда. "
-                u"Проверьте, нет ли ошибки, и упростите: используйте только цифры для номера суда, "
-                u"только кирилические буквы для фамилии.".format(
-                    court_last_name, court_number
-                ),
-                reply_markup=FILLED_MARKUP)
+            if not silent_if_fine:
+                update.message.reply_text(
+                    u"Указанная фамилия `{}` или номер суда `{}` не подходят к формату сайта суда. "
+                    u"Проверьте, нет ли ошибки, и упростите: используйте только цифры для номера суда, "
+                    u"только кирилические буквы для фамилии.".format(
+                        court_last_name, court_number
+                    ),
+                    reply_markup=FILLED_MARKUP)
 
     return ConversationHandler.END
+
+
+def cron_check(bot, job):
+    for subscriber in Subscriber.select().where(
+        Subscriber.deleted == False
+    ):
+        try:
+            update = FakeUpdate(bot, subscriber.chat_id)
+            court_status_check(bot, update, silent_if_fine=True)
+        except Exception, e:
+            print e
+            continue
 
 
 @botan_track('unsubscribe')
@@ -277,7 +303,8 @@ def unsubscribe(bot, update):
             Subscriber.chat_id == update.message.chat_id)
         subscriber.execute()
         bot.sendMessage(update.message.chat_id,
-                        text='Подписка удалена успешно, спасибо, что проявили интерес!')
+                        text='Подписка удалена успешно, спасибо, что проявили интерес!'
+                             ' Чтобы возобновить подписку, воспользуйтесь командой /start')
     except:
         bot.sendMessage(update.message.chat_id,
                         text='ERROR occured, action NOT executed. See console output!')
@@ -304,6 +331,7 @@ def main():
     # Create the EventHandler and pass it your bot's token.
     # updater = Updater(TELEGRAM_TOKEN, workers=5)
     updater = Updater(TELEGRAM_TOKEN)
+    job_queue = updater.job_queue
 
     # Get the dispatcher to register handlers
     dp = updater.dispatcher
@@ -317,11 +345,11 @@ def main():
                                    update,
                                    pass_user_data=True),
                       RegexHandler(u'^Фамилия$',
-                                    await_last_name,
-                                    pass_user_data=True),
+                                   await_last_name,
+                                   pass_user_data=True),
                       RegexHandler(u'^Номер мирового суда$',
-                                    await_court_num,
-                                    pass_user_data=True),
+                                   await_court_num,
+                                   pass_user_data=True),
                       ],
 
         states={
@@ -348,6 +376,10 @@ def main():
         u'^Проверить статус судов$', court_status_check))
     dp.add_handler(RegexHandler(u'^Отменить подписку$', unsubscribe))
     dp.add_handler(CommandHandler('status', status))
+
+    # Add daily court check
+    job_minute = Job(cron_check, DAILY)
+    job_queue.put(job_minute, next_t=0)
 
     # log all errors
     dp.add_error_handler(error)

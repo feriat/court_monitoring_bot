@@ -89,12 +89,16 @@ def botan_track(command):
     def decorator(function):
         def wrapper(*args, **kwargs):
             res = function(*args, **kwargs)
-            update = args[1]
-            uid = update.message.from_user.id
-            message_dict = update.message.to_dict()
-            #event_name = update.message.text
-            botan.track(BOTAN_IO, uid, message_dict, command)
-            return res
+            try:
+                update = args[1]
+                uid = update.message.from_user.id
+                message_dict = update.message.to_dict()
+                #event_name = update.message.text
+                botan.track(BOTAN_IO, uid, message_dict, command)
+            except:
+                pass 
+            finally:
+                return res
 
         return wrapper
     return decorator

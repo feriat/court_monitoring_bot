@@ -16,6 +16,7 @@ import datetime
 from peewee import SqliteDatabase, Model, CharField, DateTimeField, \
     IntegerField, BooleanField, BigIntegerField, TextField, \
     IntegrityError
+import peewee
 
 import logging
 
@@ -84,7 +85,7 @@ class Subscriber(Model):
     court_last_name = TextField(default="")
     email = TextField(default="")
     class Meta:
-        database = SqliteDatabase('database/DB.db')
+        database = SqliteDatabase('database/DB.db', check_same_thread=False)
 
 
 def botan_track(command):
@@ -115,16 +116,16 @@ def valid_court_number(text):
 
 
 def check_data_completeness(bot, update, *args):
-    for subscriber in Subscriber.select().where(
+    subscriber = Subscriber.get(
         Subscriber.chat_id == update.message.chat_id
-    ):
-        court_last_name, court_info = subscriber.court_last_name, subscriber.court_info
-        court_info = json.loads(court_info or "{}")
-        court_number = court_info.get('magistrate_court_num', None)
-        if not court_last_name:
-            return await_last_name(bot, update, *args)
-        elif not court_number:
-            return await_court_num(bot, update, *args)
+    )
+    court_last_name, court_info = subscriber.court_last_name, subscriber.court_info
+    court_info = json.loads(court_info or "{}")
+    court_number = court_info.get('magistrate_court_num', None)
+    if not court_last_name:
+        return await_last_name(bot, update, *args)
+    elif not court_number:
+        return await_court_num(bot, update, *args)
 
     update.message.reply_text("Все необходимые данные заполнены! Теперь несколько "
                               "раз в сутки бот будет проверять наличие исков "
@@ -229,39 +230,48 @@ def received_information(bot, update, user_data):
 @botan_track('court_status_check')
 def court_status_check(bot, update, silent_if_fine=False):
     plaintiff = u'жилсервис'
-    for subscriber in Subscriber.select().where(
+    print update.message.chat_id
+    subscriber = Subscriber.get(
         Subscriber.chat_id == update.message.chat_id
-    ):
-        court_last_name, court_info = subscriber.court_last_name, subscriber.court_info
-        court_info = json.loads(court_info or "{}")
-        court_number = court_info.get('magistrate_court_num', None)
-        if not court_last_name or not court_number:
-            if not silent_if_fine:
-                update.message.reply_text("Не все поля заполнены: мне необходимо знать "
-                                          "как минимум номер суда и вашу фамилию.")
-            return
-
+    )
+    court_last_name, court_info = subscriber.court_last_name, subscriber.court_info
+    court_info = json.loads(court_info or "{}")
+    court_number = court_info.get('magistrate_court_num', None)
+    if not court_last_name or not court_number:
         if not silent_if_fine:
-            update.message.reply_text(u"Проверяю мировой суд номер {}, ответчик `{}`, "
-                                      u"истец {}".format(
-                                          court_number, court_last_name, plaintiff),
-                                      reply_markup=FILLED_MARKUP)
-        try:
-            df = get_magistrate_court(
-                court='mos-sud', court_num=court_number, defendant=court_last_name, plaintiff=plaintiff
-            )
-            if df is not None and len(df) > 0:
-                print make_url(court='mos-sud', court_num=court_number,
-                               defendant=court_last_name, plaintiff=plaintiff)
-                update.message.reply_text(
-                    u"ВНИМАНИЕ! \n"
-                    u"Найден иск против вас! \n"
-                    u"Пройдите по ссылке, чтобы ознакомиться с ним. {}".format(
-                        make_url(court='mos-sud', court_num=court_number,
-                                 defendant=court_last_name, plaintiff=plaintiff)
-                    ),
-                    reply_markup=FILLED_MARKUP)
-            elif not silent_if_fine:
+            update.message.reply_text("Не все поля заполнены: мне необходимо знать "
+                                      "как минимум номер суда и вашу фамилию.")
+        return
+
+    if not silent_if_fine:
+        update.message.reply_text(u"Проверяю мировой суд номер {}, ответчик `{}`, "
+                                  u"истец {}".format(
+                                      court_number, court_last_name, plaintiff),
+                                  reply_markup=FILLED_MARKUP)
+    try:
+        df = get_magistrate_court(
+            court='mos-sud', court_num=court_number, defendant=court_last_name, plaintiff=plaintiff
+        )
+        if df is None:
+            num_claims = 0
+        else:
+            num_claims = len(df)
+        previous_claims = court_info.get('mos-sud-count', 0)
+
+        if num_claims > previous_claims:
+            print make_url(court='mos-sud', court_num=court_number,
+                           defendant=court_last_name, plaintiff=plaintiff)
+            update.message.reply_text(
+                u"ВНИМАНИЕ! \n"
+                u"Найден новый иск против вас! Всего исков: {}.\n"
+                u"Пройдите по ссылке, чтобы ознакомиться с ним. {}".format(
+                    num_claims,
+                    make_url(court='mos-sud', court_num=court_number,
+                             defendant=court_last_name, plaintiff=plaintiff)
+                ),
+                reply_markup=FILLED_MARKUP)
+        elif not silent_if_fine:
+            if num_claims == 0:
                 update.message.reply_text(
                     u"Исков не найдено, отлично! \n"
                     u"Убедиться в этом можно по ссылке: {}".format(
@@ -269,17 +279,85 @@ def court_status_check(bot, update, silent_if_fine=False):
                                  defendant=court_last_name, plaintiff=plaintiff)
                     ),
                     reply_markup=FILLED_MARKUP)
-        except ValueError, e:
-            print e
-            raise
-            if not silent_if_fine:
+            else:
                 update.message.reply_text(
-                    u"Указанная фамилия `{}` или номер суда `{}` не подходят к формату сайта суда. "
-                    u"Проверьте, нет ли ошибки, и упростите: используйте только цифры для номера суда, "
-                    u"только кирилические буквы для фамилии.".format(
-                        court_last_name, court_number
+                    u"Новых исков не найдено. \n"
+                    u"Убедиться в этом можно по ссылке: {}".format(
+                        make_url(court='mos-sud', court_num=court_number,
+                                 defendant=court_last_name, plaintiff=plaintiff)
                     ),
                     reply_markup=FILLED_MARKUP)
+        try:
+            court_info.update({'mos-sud-count':num_claims})
+            Subscriber.update(
+                court_info=json.dumps(court_info)
+            ).where(
+                Subscriber.chat_id == update.message.chat_id
+            ).execute()
+        except peewee.OperationalError:
+            pass
+
+
+        df = get_magistrate_court(
+            court='mos-sud-claim', court_num=court_number, defendant=court_last_name, plaintiff=plaintiff
+        )
+        if df is None:
+            num_claims = 0
+        else:
+            num_claims = len(df)
+        previous_claims = court_info.get('mos-sud-claims-count', 0)
+
+        if num_claims > previous_claims:
+            print make_url(court='mos-sud-claim', court_num=court_number,
+                           defendant=court_last_name, plaintiff=plaintiff)
+            update.message.reply_text(
+                u"ВНИМАНИЕ! \n"
+                u"Найдено новое исковое заявление против вас! Всего заявлений: {}.\n"
+                u"Пройдите по ссылке, чтобы ознакомиться с ним. {}".format(
+                    num_claims,
+                    make_url(court='mos-sud-claim', court_num=court_number,
+                             defendant=court_last_name, plaintiff=plaintiff)
+                ),
+                reply_markup=FILLED_MARKUP)
+        elif not silent_if_fine:
+            if num_claims == 0:
+                update.message.reply_text(
+                    u"Исковых заявлений не найдено, отлично! \n"
+                    u"Убедиться в этом можно по ссылке: {}".format(
+                        make_url(court='mos-sud-claim', court_num=court_number,
+                                 defendant=court_last_name, plaintiff=plaintiff)
+                    ),
+                    reply_markup=FILLED_MARKUP)
+            else:
+                update.message.reply_text(
+                    u"Новых исковых заявлений не найдено. \n"
+                    u"Убедиться в этом можно по ссылке: {}".format(
+                        make_url(court='mos-sud-claim', court_num=court_number,
+                                 defendant=court_last_name, plaintiff=plaintiff)
+                    ),
+                    reply_markup=FILLED_MARKUP)
+        try:
+            court_info.update({'mos-sud-claims-count':num_claims})
+            Subscriber.update(
+                court_info=json.dumps(court_info)
+            ).where(
+                Subscriber.chat_id == update.message.chat_id
+            ).execute()
+        except peewee.OperationalError:
+            pass
+
+
+    except ValueError, e:
+        print e
+        raise
+        if not silent_if_fine:
+            update.message.reply_text(
+                u"Указанная фамилия `{}` или номер суда `{}` не подходят к формату сайта суда. "
+                u"Проверьте, нет ли ошибки, и упростите: используйте только цифры для номера суда, "
+                u"только кирилические буквы для фамилии.".format(
+                    court_last_name, court_number
+                ),
+                reply_markup=FILLED_MARKUP)
 
     return ConversationHandler.END
 
@@ -293,7 +371,6 @@ def cron_check(bot, job):
             court_status_check(bot, update, silent_if_fine=True)
         except Exception, e:
             print e
-            continue
 
 
 @botan_track('unsubscribe')
@@ -379,7 +456,7 @@ def main():
 
     # Add daily court check
     job_minute = Job(cron_check, DAILY)
-    job_queue.put(job_minute, next_t=0)
+    job_queue.put(job_minute, next_t=DAILY)
 
     # log all errors
     dp.add_error_handler(error)
